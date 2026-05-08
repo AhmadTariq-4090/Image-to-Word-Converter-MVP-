@@ -1,169 +1,374 @@
+import os
+
 import streamlit as st
 from PIL import Image
-import pytesseract
-from docx import Document
-import io
-import os
-import google.generativeai as genai
 
-# Page Config
-st.set_page_config(page_title="Image-to-Word Converter", layout="wide")
+from agents import ActionAgent, DecisionAgent, FeedbackAgent, PerceptionAgent
+from memory import MemoryStore
 
-# Title
-st.title("📄 Image-to-Word Converter MVP")
-st.markdown("Convert your images to editable Word documents using **OCR** or **AI Vision**.")
-
-# --- Sidebar ---
-st.sidebar.header("⚙️ Settings")
-engine = st.sidebar.radio(
-    "Select Processing Engine",
-    ("Tesseract OCR (Fast/Free)", "AI Vision (Google Gemini)")
+st.set_page_config(
+    page_title="🤖 Agentic Image-to-Word",
+    layout="wide",
+    page_icon="🤖",
 )
 
-api_key = None
-if "AI Vision" in engine:
-    # Try to get from environment variable first
-    env_key = os.getenv("AIzaSyA4quSrLXH1bpMTFOtKysZZh0kzebkaSUc")
-    api_key = st.sidebar.text_input("Enter Google Gemini API Key", value=env_key if env_key else "", type="password")
-    if not api_key:
-        st.sidebar.warning("⚠️ API Key is required for AI Vision.")
-    else:
-        st.sidebar.success("API Key provided!")
+# ── Agent initialization (cached for lifetime of server process) ──────────────
+@st.cache_resource
+def init_agents():
+    mem = MemoryStore()
+    return mem, PerceptionAgent(), DecisionAgent(), ActionAgent(), FeedbackAgent(mem)
 
-# --- Main Interface ---
-tab1, tab2 = st.tabs(["📤 Upload Image", "📸 Camera Capture"])
+memory, perception_agent, decision_agent, action_agent, feedback_agent = init_agents()
 
-image_files = []
+# ── Session state bootstrap ───────────────────────────────────────────────────
+_DEFAULTS = {
+    "session_id":      memory.new_session_id(),
+    "image_analyses":  [],   # [{name, image, file_bytes, perception, decision}]
+    "results":         [],   # [{text, confidence, engine, ...}]
+    "converted":       False,
+    "last_file_names": [],
+}
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-with tab1:
-    uploaded_files = st.file_uploader("Upload Images (JPG/PNG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
-    if uploaded_files:
-        image_files.extend(uploaded_files)
-        st.success(f"{len(uploaded_files)} images uploaded.")
-
-with tab2:
-    camera_image = st.camera_input("Take a picture")
-    if camera_image:
-        image_files.append(camera_image)
-        st.success("Image captured from camera.")
-
-# --- Helper Functions ---
-
-def process_with_tesseract(image):
-    """Extracts text using Tesseract OCR."""
-    try:
-        # Optional: Add pre-processing here (grayscale, threshold) if needed
-        # gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY) # Requires opencv
-        text = pytesseract.image_to_string(image)
-        return text
-    except Exception as e:
-        return f"Error in Tesseract OCR: {str(e)}"
-
-def process_with_gemini(image, api_key):
-    """Extracts text and formatting using Google Gemini."""
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        prompt = """
-        You are an expert document digitizer. 
-        Convert the text in this image into Markdown format.
-        Preserve the following formatting exactly as seen in the image:
-        - Headers (#, ##, ###)
-        - Bold (**text**)
-        - Italics (*text*)
-        - Bullet points (- item) and Numbered lists (1. item)
-        - Paragraph structure.
-        Do not add any preamble or sentences like "Here is the markdown". Just return the markdown content.
-        """
-        
-        response = model.generate_content([prompt, image])
-        return response.text
-    except Exception as e:
-        return f"Error in Gemini Vision: {str(e)}"
-
-def add_markdown_to_doc(doc, markdown_text):
-    """Parses simple Markdown and adds it to the python-docx Document."""
-    lines = markdown_text.split('\n')
-    for line in lines:
-        line = line.strip()
-        if not line:
-            doc.add_paragraph("") # Add empty line
-            continue
-            
-        # Headers
-        if line.startswith('# '):
-            doc.add_heading(line[2:], level=1)
-        elif line.startswith('## '):
-            doc.add_heading(line[3:], level=2)
-        elif line.startswith('### '):
-            doc.add_heading(line[4:], level=3)
-        # List Items (Basic support)
-        elif line.startswith('- ') or line.startswith('* '):
-            p = doc.add_paragraph(line[2:], style='List Bullet')
-        elif line.startswith('1. '): # Simple Check for "1. "
-            p = doc.add_paragraph(line[3:], style='List Number')
-        else:
-            # Normal Paragraph with Bold/Italic support
-            p = doc.add_paragraph()
-            # A simple parser for bold (**text**)
-            parts = line.split('**')
-            for i, part in enumerate(parts):
-                runner = p.add_run(part)
-                if i % 2 == 1: # Odd indices are between ** ** (bold)
-                    runner.bold = True
-            # Note regarding Italics: This creates a limitation where we can't nest bold/italics easily 
-            # with this split method. This is a basic MVP parser. Prod usage would need a regex parser.
-
-# --- Processing Section ---
-if image_files:
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("🤖 Agent Control Panel")
+    st.caption(f"Session `{st.session_state.session_id}`")
     st.divider()
-    st.subheader(f"Processing {len(image_files)} Image(s)")
-    
-    # Preview
-    cols = st.columns(min(len(image_files), 3))
-    for idx, img_file in enumerate(image_files[:3]): # Show max 3 previews
-        with cols[idx]:
-            st.image(img_file, caption=f"Image {idx+1}", use_container_width=True)
-    if len(image_files) > 3:
-        st.info(f"...and {len(image_files)-3} more.")
 
-    if st.button("🚀 Convert to Word Document", type="primary"):
-        if "AI Vision" in engine and not api_key:
-            st.error("Please provide a Google Gemini API Key in the sidebar.")
-        else:
-            with st.spinner("Processing... Please wait."):
-                # 1. Initialize Docx
-                doc = Document()
-                doc.add_heading('Converted Document', 0)
+    st.subheader("⚙️ Configuration")
+    api_key = st.text_input(
+        "Gemini API Key",
+        type="password",
+        value=os.getenv("GEMINI_API_KEY", ""),
+        help="Required only when the agent selects the Gemini engine.",
+    )
+    auto_convert = st.toggle("⚡ Auto-convert on upload", value=False)
 
-                # 2. Loop through images
-                for i, img_file in enumerate(image_files):
-                    img = Image.open(img_file)
-                    st.write(f"Processing Image {i+1}/{len(image_files)}...")
-                    
-                    # 3. Apply Engine Logic
-                    extracted_text = ""
-                    if "Tesseract" in engine:
-                        extracted_text = process_with_tesseract(img)
-                        # Add raw text to doc
-                        doc.add_paragraph(extracted_text)
-                        doc.add_page_break()
-                        
-                    elif "AI Vision" in engine:
-                        extracted_text = process_with_gemini(img, api_key)
-                        # Parse Markdown to Doc
-                        add_markdown_to_doc(doc, extracted_text)
-                        doc.add_page_break()
-                
-                # 4. Save and Provide Download
-                bio = io.BytesIO()
-                doc.save(bio)
-                
-                st.success("✅ Conversion Complete!")
-                st.download_button(
-                    label="⬇️ Download Word Document",
-                    data=bio.getvalue(),
-                    file_name="converted_document.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    st.divider()
+    st.subheader("🧠 Agent Memory")
+    stats = memory.get_stats()
+    c1, c2 = st.columns(2)
+    c1.metric("Sessions", stats["total_sessions"])
+    c2.metric("Corrections", stats["total_corrections"])
+    st.metric("Avg Confidence", f"{stats['avg_confidence'] * 100:.0f}%")
+
+    prefs = memory.get_engine_preferences()
+    if prefs:
+        st.caption("📊 Learned Preferences")
+        for ct, p in prefs.items():
+            st.caption(
+                f"• **{ct}** → {p['preferred_engine']} "
+                f"({p['usage_count']} samples, "
+                f"{p['confidence'] * 100:.0f}% satisfaction)"
+            )
+
+# ── Header ────────────────────────────────────────────────────────────────────
+st.title("🤖 Agentic Image-to-Word Converter")
+st.markdown(
+    "An intelligent pipeline that **perceives** image quality, "
+    "**decides** the best OCR engine, **acts** to convert, and "
+    "**learns** from your feedback — fully agentic."
+)
+
+tab_convert, tab_memory, tab_logs = st.tabs(
+    ["📤 Convert", "🧠 Memory & Learning", "📋 Logs"]
+)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 1 — CONVERT
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_convert:
+
+    # ── STEP 1: Input ─────────────────────────────────────────────────────────
+    st.subheader("Step 1 › Input")
+    in_tab_upload, in_tab_camera = st.tabs(["📤 Upload", "📸 Camera"])
+    image_files = []
+
+    with in_tab_upload:
+        uploaded = st.file_uploader(
+            "Upload Images (JPG/PNG)",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+        )
+        if uploaded:
+            image_files.extend(uploaded)
+
+    with in_tab_camera:
+        cam = st.camera_input("Take a photo")
+        if cam:
+            image_files.append(cam)
+
+    # ── STEP 2: Perception Agent (auto-runs on new uploads) ───────────────────
+    if image_files:
+        st.divider()
+        st.subheader("Step 2 › 🔍 Perception Agent")
+
+        current_names = [f.name for f in image_files]
+        if current_names != st.session_state.last_file_names:
+            # New files — reset state and re-analyse
+            st.session_state.image_analyses = []
+            st.session_state.results        = []
+            st.session_state.converted      = False
+            st.session_state.last_file_names = current_names
+
+            for f in image_files:
+                img        = Image.open(f)
+                perception = perception_agent.analyze(img)
+                prefs      = memory.get_engine_preferences()
+                decision   = decision_agent.decide(
+                    perception, prefs, api_key_available=bool(api_key)
                 )
+                st.session_state.image_analyses.append({
+                    "name":       f.name,
+                    "image":      img,
+                    "file_bytes": f.getvalue(),
+                    "perception": perception,
+                    "decision":   decision,
+                })
+                memory.log(
+                    st.session_state.session_id, "INFO",
+                    f"Perceived {f.name}: quality={perception['quality_score']}, "
+                    f"type={perception['content_type']}, "
+                    f"engine→{decision['engine']}",
+                )
+
+        # Display perception cards
+        for analysis in st.session_state.image_analyses:
+            p = analysis["perception"]
+            with st.expander(
+                f"📷 {analysis['name']}  —  Quality: {p['quality_score']}/100",
+                expanded=True,
+            ):
+                col_img, col_info = st.columns([1, 2])
+                with col_img:
+                    st.image(analysis["image"], use_container_width=True)
+                with col_info:
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Quality",      f"{p['quality_score']}/100")
+                    m2.metric("Content Type", p["content_type"].replace("_", " ").title())
+                    m3.metric("Sharpness",    f"{min(p['blur_score'], 999):.0f}")
+                    if p["issues"]:
+                        st.warning(f"⚠️ Issues: {', '.join(p['issues'])}")
+                        if p["suggested_preprocessing"]:
+                            st.info(f"🔧 Auto-preprocessing: {', '.join(p['suggested_preprocessing'])}")
+                    else:
+                        st.success("✅ Image quality is good")
+
+        # ── STEP 3: Decision Agent ─────────────────────────────────────────────
+        st.divider()
+        st.subheader("Step 3 › 🧠 Decision Agent")
+
+        for i, analysis in enumerate(st.session_state.image_analyses):
+            d = analysis["decision"]
+            col_info, col_override = st.columns([3, 1])
+            icon = "⚡" if d["engine"] == "tesseract" else "🤖"
+            with col_info:
+                st.info(
+                    f"{icon} **{analysis['name']}** → **{d['engine'].title()}**  \n"
+                    f"Rationale: *{d['rationale']}*  \n"
+                    f"Expected confidence: **{d['confidence_expected'] * 100:.0f}%**"
+                )
+            with col_override:
+                override = st.selectbox(
+                    "Override (Human-in-the-Loop)",
+                    ["(Agent choice)", "tesseract", "gemini"],
+                    key=f"override_{i}",
+                )
+                if override != "(Agent choice)":
+                    st.session_state.image_analyses[i]["decision"]["engine"] = override
+                    memory.log(
+                        st.session_state.session_id, "INFO",
+                        f"Human override: {analysis['name']} → {override}",
+                    )
+
+        # ── STEP 4: Action Agent ───────────────────────────────────────────────
+        st.divider()
+        st.subheader("Step 4 › ⚙️ Action Agent")
+
+        convert_clicked = st.button(
+            "🚀 Convert to Word Document",
+            type="primary",
+            use_container_width=True,
+        )
+        needs_gemini = any(
+            a["decision"]["engine"] == "gemini"
+            for a in st.session_state.image_analyses
+        )
+
+        if convert_clicked or (auto_convert and not st.session_state.converted):
+            if needs_gemini and not api_key:
+                st.error("❌ A Gemini API key is required. Add it in the sidebar or override the engine to Tesseract.")
+            else:
+                st.session_state.results  = []
+                total_time = 0.0
+
+                with st.spinner("Agent is processing…"):
+                    progress = st.progress(0)
+                    for idx, analysis in enumerate(st.session_state.image_analyses):
+                        engine = analysis["decision"]["engine"]
+                        img    = analysis["image"]
+
+                        # Apply preprocessing if suggested
+                        steps = analysis["decision"]["preprocessing"]
+                        if steps:
+                            img = perception_agent.preprocess(img, steps)
+
+                        result          = action_agent.process(img, engine, api_key)
+                        result["name"]  = analysis["name"]
+                        result["image_hash"] = memory.hash_image(analysis["file_bytes"])
+                        st.session_state.results.append(result)
+                        total_time += result["processing_time"]
+
+                        memory.log(
+                            st.session_state.session_id,
+                            "INFO" if result["success"] else "ERROR",
+                            f"Processed {analysis['name']}: engine={engine}, "
+                            f"confidence={result['confidence']}, "
+                            f"time={result['processing_time']}s",
+                        )
+                        progress.progress((idx + 1) / len(st.session_state.image_analyses))
+
+                if st.session_state.results:
+                    avg_conf = sum(r["confidence"] for r in st.session_state.results) / len(st.session_state.results)
+                    first    = st.session_state.image_analyses[0]
+                    memory.save_session(
+                        session_id      = st.session_state.session_id,
+                        image_count     = len(st.session_state.results),
+                        engine_used     = first["decision"]["engine"],
+                        quality_score   = first["perception"]["quality_score"],
+                        content_type    = first["perception"]["content_type"],
+                        processing_time = total_time,
+                        confidence      = avg_conf,
+                    )
+                    st.session_state.converted = True
+
+        # ── STEP 5: Results + Download ─────────────────────────────────────────
+        if st.session_state.results:
+            st.divider()
+            st.subheader("Step 5 › 📄 Results")
+
+            avg_conf    = sum(r["confidence"] for r in st.session_state.results) / len(st.session_state.results)
+            all_success = all(r["success"] for r in st.session_state.results)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Images Processed", len(st.session_state.results))
+            m2.metric(
+                "Avg Confidence", f"{avg_conf * 100:.0f}%",
+                delta="Good" if avg_conf > 0.75 else "Low — Gemini may help",
+            )
+            m3.metric("Status", "✅ Success" if all_success else "⚠️ Partial")
+
+            for result in st.session_state.results:
+                dot = "🟢" if result["confidence"] > 0.75 else ("🟡" if result["confidence"] > 0.5 else "🔴")
+                with st.expander(
+                    f"{dot} {result['name']}  —  {result['engine'].title()}  |  "
+                    f"Confidence: {result['confidence'] * 100:.0f}%  |  "
+                    f"{result['word_count']} words  |  {result['processing_time']}s"
+                ):
+                    if result["success"]:
+                        st.text_area(
+                            "Extracted Text (editable preview)",
+                            result["text"], height=200,
+                            key=f"text_{result['name']}",
+                        )
+                    else:
+                        st.error(result["text"])
+
+            if all_success:
+                docx_bytes = action_agent.generate_docx(st.session_state.results)
+                st.download_button(
+                    "⬇️ Download Word Document",
+                    data=docx_bytes,
+                    file_name="converted_document.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                    type="primary",
+                )
+
+            # ── STEP 6: Feedback Agent ─────────────────────────────────────────
+            st.divider()
+            st.subheader("Step 6 › 💬 Feedback Agent — Teach the System")
+            st.caption("Your feedback is stored in long-term memory and shapes future engine decisions.")
+
+            fb_col1, fb_col2 = st.columns(2)
+            with fb_col1:
+                satisfied = st.radio("Was the output accurate?", ["👍 Yes", "👎 No"], horizontal=True)
+                if st.button("Submit Feedback", key="btn_satisfaction"):
+                    is_sat = satisfied == "👍 Yes"
+                    for idx, result in enumerate(st.session_state.results):
+                        analysis = st.session_state.image_analyses[idx]
+                        feedback_agent.record_satisfaction(
+                            session_id   = st.session_state.session_id,
+                            engine_used  = result["engine"],
+                            content_type = analysis["perception"]["content_type"],
+                            satisfied    = is_sat,
+                        )
+                    st.success("✅ Feedback saved — agent will learn from this.")
+
+            with fb_col2:
+                names   = [r["name"] for r in st.session_state.results]
+                target  = st.selectbox("Submit a text correction for:", names)
+                corrected = st.text_area("Paste corrected text:", height=100)
+                if st.button("Submit Correction", key="btn_correction") and corrected:
+                    idx      = names.index(target)
+                    result   = st.session_state.results[idx]
+                    analysis = st.session_state.image_analyses[idx]
+                    feedback_agent.record_correction(
+                        session_id    = st.session_state.session_id,
+                        image_hash    = result["image_hash"],
+                        original_text = result["text"],
+                        corrected_text = corrected,
+                        engine_used   = result["engine"],
+                        content_type  = analysis["perception"]["content_type"],
+                    )
+                    st.success("✅ Correction saved — agent will prefer a better engine next time.")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 2 — MEMORY & LEARNING
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_memory:
+    st.subheader("🧠 Long-Term Memory (SQLite)")
+
+    prefs = memory.get_engine_preferences()
+    if prefs:
+        st.markdown("**Learned Engine Preferences**")
+        st.table([
+            {
+                "Content Type":    ct,
+                "Preferred Engine": p["preferred_engine"],
+                "Satisfaction":    f"{p['confidence'] * 100:.0f}%",
+                "Samples":         p["usage_count"],
+            }
+            for ct, p in prefs.items()
+        ])
+    else:
+        st.info("No preferences learned yet. Convert images and submit feedback to teach the agent.")
+
+    st.divider()
+    st.markdown("**Recent Sessions**")
+    sessions = memory.get_recent_sessions(10)
+    if sessions:
+        st.table(sessions)
+    else:
+        st.info("No sessions recorded yet.")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — LOGS
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_logs:
+    st.subheader("📋 Processing Logs")
+    col_filter, col_clear = st.columns([3, 1])
+    show_session_only = col_filter.checkbox("Current session only", value=False)
+    logs = memory.get_logs(
+        session_id=st.session_state.session_id if show_session_only else None,
+        limit=200,
+    )
+    if logs:
+        for entry in logs:
+            icon = {"INFO": "ℹ️", "WARNING": "⚠️", "ERROR": "🔴"}.get(entry["level"], "•")
+            st.caption(f"{icon} `{entry['timestamp'][:19]}` — {entry['message']}")
+    else:
+        st.info("No logs yet.")
