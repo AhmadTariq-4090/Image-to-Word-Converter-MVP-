@@ -72,7 +72,7 @@ class ActionAgent:
     def _gemini(self, image: Image.Image, api_key: str) -> tuple:
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("gemini-2.5-flash")
             prompt = (
                 "You are an expert document digitizer. "
                 "Convert the text in this image into Markdown format. "
